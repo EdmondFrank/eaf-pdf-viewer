@@ -311,8 +311,6 @@ class AppBuffer(Buffer):
             self.buffer_widget.annot_handler("move")
 
     def set_focus_text(self, new_text):
-        new_text = base64.b64decode(new_text).decode("utf-8")
-
         if self.buffer_widget.is_select_mode:
             self.buffer_widget.annot_select_char_area("text", new_text)
         elif self.buffer_widget.is_hover_annot:
