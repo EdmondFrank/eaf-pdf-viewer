@@ -20,13 +20,17 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 from PyQt5 import QtCore
-from PyQt5.QtCore import Qt, QRect, QPoint, QEvent, QTimer, QFileSystemWatcher
+from PyQt5.QtCore import Qt, QRect, QRectF, QPoint, QEvent, QTimer, QFileSystemWatcher
 from PyQt5.QtGui import QColor, QPixmap, QImage, QFont, QCursor
 from PyQt5.QtGui import QPainter, QPolygon, QPalette
 from PyQt5.QtWidgets import QWidget
 from PyQt5.QtWidgets import QToolTip
 from core.buffer import Buffer
-from core.utils import touch, interactive, eval_in_emacs, message_to_emacs, open_url_in_new_tab, translate_text, atomic_edit, get_emacs_var, get_emacs_vars, get_emacs_func_result, get_emacs_config_dir, get_emacs_theme_mode, get_emacs_theme_foreground, get_emacs_theme_background
+from core.utils import (touch, interactive, eval_in_emacs, message_to_emacs,
+                        open_url_in_new_tab, translate_text, atomic_edit,
+                        get_emacs_var, get_emacs_vars, get_emacs_func_result,
+                        get_emacs_config_dir, get_emacs_theme_mode,
+                        get_emacs_theme_foreground, get_emacs_theme_background)
 import fitz
 import time
 import random
@@ -38,6 +42,7 @@ import platform
 import base64
 import threading
 from collections import defaultdict
+import re
 
 def get_page_crop_box(page):
     if hasattr(page, "page_cropbox"):
@@ -370,6 +375,26 @@ class AppBuffer(Buffer):
         self.buffer_widget.jump_to_rect(int(page_index), rect)
         return ""
 
+    def delete_pdf_pages(self, pages):
+        page_list = re.split(' +', pages)
+        if len(page_list) > 1:
+            start_page = int(page_list[0]) - 1
+            end_page = int(page_list[1]) - 1
+            if (start_page >= end_page):
+                message_to_emacs(" start page must less than end page")
+            elif (start_page < 0)  or (start_page > self.buffer_widget.page_total_number) :
+                message_to_emacs(" start page err")
+            elif (end_page < 0)  or (end_page > self.buffer_widget.page_total_number):
+                message_to_emacs(" end page err")
+            else:
+                self.buffer_widget.delete_pdf_pages(start_page, end_page)
+        else:
+            page = int(page_list[0]) - 1
+            if (page < 0)  or (page > self.buffer_widget.page_total_number):
+                message_to_emacs("page err")
+            else:
+                self.buffer_widget.delete_pdf_page(page)
+
     def fetch_marker_callback(self):
         return list(map(lambda x: x.lower(), self.buffer_widget.jump_link_key_cache_dict.keys()))
 
@@ -556,6 +581,9 @@ class PdfPage(fitz.Page):
         self._page_char_rect_list = self._init_page_char_rect_list()
         self._tight_margin_rect = self._init_tight_margin()
 
+        self.has_annot = page.firstAnnot
+        self.hovered_annot = None
+
     def __getattr__(self, attr):
         return getattr(self.page, attr)
 
@@ -657,7 +685,59 @@ class PdfPage(fitz.Page):
 
         img = QImage(pixmap.samples, pixmap.width, pixmap.height, pixmap.stride, QImage.Format_RGBA8888)
         qpixmap = QPixmap.fromImage(img)
+
+        if self.has_annot:
+            qpixmap = self.draw_annots(qpixmap, scale)
+
         return qpixmap
+
+    def draw_annots(self, pixmap, scale):
+        if self.hovered_annot is None:
+            return pixmap
+
+        qp = QPainter(pixmap)
+        qp.setRenderHint(QPainter.Antialiasing)
+        qp.setCompositionMode(QPainter.CompositionMode_DestinationAtop)
+        annot = self.hovered_annot
+
+        r, g, b = getattr(annot.colors, "stroke", (1.0, 0.84, 0.08))
+        color = QColor(int(r) * 255, int(g) * 255, int(b) * 255, 153)
+
+        vertices = annot.vertices
+        if vertices is not None and len(vertices) % 4 == 0:
+            for i in range(0, len(vertices), 4):
+                # top-left and bottom-right point
+                rect = fitz.Rect(vertices[i], vertices[i+3]) * scale
+                qrect = QRectF(rect.x0, rect.y0, rect.width, rect.height)
+                qp.fillRect(qrect, color)
+        else:
+            rect = annot.rect
+            qrect = QRectF(rect.x0, rect.y0, rect.width, rect.height)
+            qp.fillRect(qrect, color)
+
+        if annot and annot.info["content"]:
+            QToolTip.showText(QCursor.pos(), annot.info["content"], None, QRect(), 10 * 1000)
+        else:
+            if QToolTip.isVisible():
+                QToolTip.hideText()
+
+        return pixmap
+
+    def can_update_annot(self, page_x, page_y):
+        if not self.has_annot:
+            return None, False
+
+        point = fitz.Point(page_x, page_y)
+        for annot in self.page.annots():
+            if point in annot.rect:
+                self.hovered_annot = annot
+                return annot, True
+
+        if self.hovered_annot is not None:
+            self.hovered_annot = None
+            return None, True
+
+        return None, False
 
     def with_invert_exclude_image(self, scale, pixmap):
         # steps:
@@ -741,7 +821,6 @@ class PdfPage(fitz.Page):
             self.page.delete_annot(annot)
         self._mark_jump_annot_list = []
 
-
 class PdfViewerWidget(QWidget):
 
     translate_double_click_word = QtCore.pyqtSignal(str)
@@ -820,11 +899,11 @@ class PdfViewerWidget(QWidget):
         self.start_char_page_index = None
         self.last_char_rect_index = None
         self.last_char_page_index = None
-        self.select_area_annot_cache_dict = defaultdict(lambda: None)
         self.select_area_annot_quad_cache_dict = {}
 
         # text annot
         self.is_hover_annot = False
+        self.hovered_annot = None
         self.edited_annot_page = (None, None)
         self.moved_annot_page = (None, None)
         # popup text annot
@@ -1071,7 +1150,11 @@ class PdfViewerWidget(QWidget):
         for index in list(range(self.start_page_index, self.last_page_index)):
             # Get page image.
             hidpi_scale_factor = self.devicePixelRatioF()
+
             qpixmap = self.get_page_pixmap(index, self.scale * hidpi_scale_factor, self.rotation)
+
+            if self.is_select_mode:
+                qpixmap = self.mark_select_char_area(index, qpixmap)
 
             # Init render rect.
             render_width = qpixmap.width() / hidpi_scale_factor
@@ -1665,7 +1748,7 @@ class PdfViewerWidget(QWidget):
         self.page_cache_pixmap_dict.clear()
         self.update()
 
-    def mark_select_char_area(self):
+    def update_select_char_area(self):
         page_dict = self.get_select_char_list()
         for page_index, chars_list in page_dict.items():
             # Using multi line rect make of abnormity select area.
@@ -1701,28 +1784,41 @@ class PdfViewerWidget(QWidget):
 
             line_rect_list = list(map(check_rect, line_rect_list))
 
-            page = self.document[page_index]
-            old_annot = self.select_area_annot_cache_dict[page_index]
-            if old_annot:
-                page.delete_annot(old_annot)
-
             quad_list = list(map(lambda x: x.quad, line_rect_list))
-            annot = page.addHighlightAnnot(quad_list)
-            annot.parent = page
 
-            # refresh annot
-            self.select_area_annot_cache_dict[page_index] = annot
+            # refresh select quad
             self.select_area_annot_quad_cache_dict[page_index] = quad_list
 
-        self.page_cache_pixmap_dict.clear()
-        self.update()
+    def mark_select_char_area(self, page_index, pixmap):
+        def quad_to_qrect(quad):
+            qrect = quad.rect * self.scale * self.devicePixelRatioF()
+            rect = QRect(int(qrect.x0), int(qrect.y0), int(qrect.width), int(qrect.height))
+            return rect
+
+        qp = QPainter(pixmap)
+        qp.setRenderHint(QPainter.Antialiasing)
+        qp.setCompositionMode(QPainter.CompositionMode_SourceAtop)
+        qp.save()
+
+        # clear old highlight
+        if page_index in self.select_area_annot_quad_cache_dict:
+            old_quads = self.select_area_annot_quad_cache_dict[page_index]
+            for quad in old_quads:
+                qp.fillRect(quad_to_qrect(quad), qp.background())
+
+        # update select area quad list
+        self.update_select_char_area()
+
+        # draw new highlight
+        if page_index in self.select_area_annot_quad_cache_dict:
+            quads = self.select_area_annot_quad_cache_dict[page_index]
+            for quad in quads:
+                qp.fillRect(quad_to_qrect(quad), QColor(self.text_highlight_annot_color))
+
+        qp.restore()
+        return pixmap
 
     def delete_all_mark_select_area(self):
-        if self.select_area_annot_cache_dict:
-            for page_index, annot in self.select_area_annot_cache_dict.items():
-                if annot and annot.parent:
-                        annot.parent.delete_annot(annot)
-                self.select_area_annot_cache_dict[page_index] = None # restore cache
         self.last_char_page_index = None
         self.last_char_rect_index = None
         self.start_char_page_index = None
@@ -1748,65 +1844,19 @@ class PdfViewerWidget(QWidget):
 
         return None
 
-    def hover_annot(self, print_msg):
-        try:
-            if self.is_move_text_annot_mode:
-                return None, None
+    def check_annot(self):
+        ex, ey, page_index = self.get_cursor_absolute_position()
+        page = self.document[page_index]
 
-            ex, ey, page_index = self.get_cursor_absolute_position()
-            page = self.document[page_index]
-            annot = page.firstAnnot
-            if not annot:
-                return None, None
+        annot, ok = page.can_update_annot(ex, ey)
+        if not ok:
+            return
 
-            annots = []
-            while annot:
-                annots.append(annot)
-                annot = annot.next
+        self.is_hover_annot = annot is not None
 
-            is_hover_annot = False
-            is_hover_tex_annot = False
-            current_annot = None
-
-            for annot in annots:
-                if annot.info["title"] and fitz.Point(ex, ey) in annot.rect:
-                    is_hover_annot = True
-                    current_annot = annot
-                    opacity = 0.5
-                    if current_annot.type[0] == fitz.PDF_ANNOT_TEXT or \
-                       current_annot.type[0] == fitz.PDF_ANNOT_FREE_TEXT:
-                        is_hover_tex_annot = True
-                else:
-                    opacity = 1.0
-                if opacity != annot.opacity:
-                    annot.set_opacity(opacity)
-                    annot.update()
-
-            # update and print message only if changed
-            if is_hover_annot != self.is_hover_annot:
-                if print_msg and self.is_buffer_focused():
-                    if not is_hover_annot:
-                        eval_in_emacs("eaf--clear-message", [])
-                    elif is_hover_tex_annot:
-                        message_to_emacs("[M-d]Delete annot [M-e]Edit text annot [M-r]Move text annot")
-                    else:
-                        message_to_emacs("[M-d]Delete annot")
-                self.is_hover_annot = is_hover_annot
-                self.page_cache_pixmap_dict.clear()
-                self.update()
-
-            if current_annot and current_annot.info["content"]:
-                if current_annot.info["id"] != self.last_hover_annot_id or not QToolTip.isVisible():
-                    QToolTip.showText(QCursor.pos(), current_annot.info["content"], None, QRect(), 10 * 1000)
-                self.last_hover_annot_id = current_annot.info["id"]
-            else:
-                if QToolTip.isVisible():
-                    QToolTip.hideText()
-
-            return page, current_annot
-        except Exception as e:
-            print("Hove Annot: ", e)
-            return None, None
+        self.hovered_annot = annot
+        self.page_cache_pixmap_dict.pop(page_index, None)
+        self.update()
 
     def save_annot(self):
         self.document.saveIncr()
@@ -1814,20 +1864,22 @@ class PdfViewerWidget(QWidget):
         self.update()
 
     def annot_handler(self, action=None):
-        page, annot = self.hover_annot(False)
+        if self.hovered_annot is None:
+            return
+        annot = self.hovered_annot
         if annot.parent:
             if action == "delete":
-                annot_action = AnnotAction.create_annot_action("Delete", page.page_index, annot)
+                annot_action = AnnotAction.create_annot_action("Delete", annot.parent.number, annot)
                 self.record_new_annot_action(annot_action)
-                page.delete_annot(annot)
+                annot.parent.delete_annot(annot)
                 self.save_annot()
             elif action == "edit":
-                self.edited_annot_page = (annot, page)
+                self.edited_annot_page = (annot, annot.parent.page)
                 if annot.type[0] == fitz.PDF_ANNOT_TEXT or \
                    annot.type[0] == fitz.PDF_ANNOT_FREE_TEXT:
                     atomic_edit(self.buffer_id, annot.info["content"].replace("\r", "\n"))
             elif action == "move":
-                self.moved_annot_page = (annot, page)
+                self.moved_annot_page = (annot, annot.parent.page)
                 if annot.type[0] == fitz.PDF_ANNOT_TEXT or \
                    annot.type[0] == fitz.PDF_ANNOT_FREE_TEXT:
                     self.enable_move_text_annot_mode()
@@ -1872,6 +1924,14 @@ class PdfViewerWidget(QWidget):
     def jump_to_rect(self, page_index, rect):
         quad = rect.quad
         self.update_vertical_offset((page_index * self.page_height + quad.ul.y) * self.scale)
+
+    def delete_pdf_page (self, page):
+        self.document.delete_page(page)
+        self.save_annot()
+
+    def delete_pdf_pages (self, start_page, end_page):
+        self.document.delete_pages(start_page, end_page)
+        self.save_annot()
 
     def current_percent(self):
         return 100.0 * self.scroll_offset / (self.max_scroll_offset() + self.rect().height())
@@ -1961,7 +2021,7 @@ class PdfViewerWidget(QWidget):
 
         if event.type() == QEvent.MouseMove:
             if self.hasMouseTracking():
-                self.hover_annot(True)
+                self.check_annot()
             else:
                 self.handle_select_mode()
 
@@ -2078,7 +2138,7 @@ class PdfViewerWidget(QWidget):
                 self.start_char_rect_index, self.start_char_page_index = rect_index, page_index
             else:
                 self.last_char_rect_index, self.last_char_page_index = rect_index, page_index
-                self.mark_select_char_area()
+                self.update()
 
     def handle_click_link(self):
         event_link = self.get_event_link()
